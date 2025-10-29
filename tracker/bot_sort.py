@@ -3,27 +3,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 
-from tracker import matching
-from tracker.gmc import GMC
-from tracker.basetrack import BaseTrack, TrackState
-from tracker.kalman_filter import KalmanFilter
+from ..tracker import matching
+from ..tracker.gmc import GMC
+from ..tracker.basetrack import BaseTrack, TrackState
+from ..tracker.kalman_filter import KalmanFilter
 
-from fast_reid.fast_reid_interfece import FastReIDInterface
+# from ..fast_reid.fast_reid_interfece import FastReIDInterface
 
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
-    def __init__(self, tlwh, score, feat=None, feat_history=50):
+    def __init__(self, tlwh, score, keypoints=None, keypoint_scores=None, feat=None, feat_history=50):
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=np.float64)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
 
         self.score = score
         self.tracklet_len = 0
+        self.keypoints = keypoints
+        self.keypoint_scores = keypoint_scores
 
         self.smooth_feat = None
         self.curr_feat = None
@@ -108,6 +110,8 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.keypoints = new_track.keypoints
+        self.keypoint_scores = new_track.keypoint_scores
 
     def update(self, new_track, frame_id):
         """
@@ -131,6 +135,8 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.keypoints = new_track.keypoints
+        self.keypoint_scores = new_track.keypoint_scores
 
     @property
     def tlwh(self):
@@ -222,47 +228,53 @@ class BoTSORT(object):
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
 
-        if args.with_reid:
-            self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
+        # if args.with_reid:
+            # self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
 
-    def update(self, output_results, img):
+    def update(self, img, bboxes, scores, keypoints=None, keypoint_scores=None, classes=None):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
 
-        if len(output_results):
-            if output_results.shape[1] == 5:
-                scores = output_results[:, 4]
-                bboxes = output_results[:, :4]
-                classes = output_results[:, -1]
-            else:
-                scores = output_results[:, 4] * output_results[:, 5]
-                bboxes = output_results[:, :4]  # x1y1x2y2
-                classes = output_results[:, -1]
+        if len(bboxes):
+            if classes is None:
+                classes = np.zeros(len(bboxes), dtype=int)  # 默认全部为0类
+            if keypoints is None:
+                keypoints = np.full((len(bboxes),), None, dtype=object)
+            if keypoint_scores is None:
+                keypoint_scores = np.full((len(bboxes),), None, dtype=object)
 
             # Remove bad detections
             lowest_inds = scores > self.track_low_thresh
             bboxes = bboxes[lowest_inds]
             scores = scores[lowest_inds]
             classes = classes[lowest_inds]
+            keypoints = keypoints[lowest_inds]
+            keypoint_scores = keypoint_scores[lowest_inds]
 
             # Find high threshold detections
             remain_inds = scores > self.args.track_high_thresh
             dets = bboxes[remain_inds]
             scores_keep = scores[remain_inds]
             classes_keep = classes[remain_inds]
+            keypoints_keep = keypoints[remain_inds]
+            keypoint_scores_keep = keypoint_scores[remain_inds]
 
         else:
             bboxes = []
-            scores = []
-            classes = []
             dets = []
+            scores = []
             scores_keep = []
+            classes = []
             classes_keep = []
+            keypoints = []
+            keypoints_keep = []
+            keypoint_scores = []
+            keypoint_scores_keep = []
 
         '''Extract embeddings '''
         if self.args.with_reid:
@@ -271,11 +283,11 @@ class BoTSORT(object):
         if len(dets) > 0:
             '''Detections'''
             if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, f) for
-                              (tlbr, s, f) in zip(dets, scores_keep, features_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, keypoints=kp, keypoint_scores=kps, feat=f) for
+                            (tlbr, s, kp, kps, f) in zip(dets, scores_keep, keypoints_keep, keypoint_scores_keep, features_keep)]
             else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                              (tlbr, s) in zip(dets, scores_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, keypoints=kp, keypoint_scores=kps) for
+                            (tlbr, s, kp, kps) in zip(dets, scores_keep, keypoints_keep, keypoint_scores_keep)]
         else:
             detections = []
 
@@ -344,16 +356,20 @@ class BoTSORT(object):
             dets_second = bboxes[inds_second]
             scores_second = scores[inds_second]
             classes_second = classes[inds_second]
+            keypoints_second = keypoints[inds_second]
+            keypoint_scores_second = keypoint_scores[inds_second]
         else:
             dets_second = []
             scores_second = []
             classes_second = []
+            keypoints_second = []
+            keypoint_scores_second = []
 
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                                 (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, keypoints=kp, keypoint_scores=kps) for
+                            (tlbr, s, kp, kps) in zip(dets_second, scores_second, keypoints_second, keypoint_scores_second)]
         else:
             detections_second = []
 
